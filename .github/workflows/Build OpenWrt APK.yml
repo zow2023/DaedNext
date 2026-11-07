@@ -189,7 +189,7 @@ jobs:
           {
             echo "### Geodata SHA256"
             echo '```'
-            sha256sum "\$dest"/*.dat
+            sha256sum "$dest"/*.dat
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
