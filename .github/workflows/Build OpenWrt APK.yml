@@ -204,6 +204,11 @@ jobs:
           "$HOME/apk-tool/apk.static" --version
           echo "APK_TOOL=$HOME/apk-tool/apk.static" >> "$GITHUB_ENV"
 
+      - name: Install nightly toolchain for eBPF
+        run: |
+          rustup toolchain install nightly-2026-05-29 --profile minimal --component rust-src
+
+
       - name: Build and package OpenWrt aarch64
         working-directory: DaedNext
         env:
