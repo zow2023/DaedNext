@@ -1,0 +1,154 @@
+name: Build daed OpenWrt aarch64 packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release version without leading v (e.g. 3.2.0). Empty uses the version in DaeNext/Cargo.toml.'
+        required: false
+        type: string
+      daenext_ref:
+        description: 'Optional DaeNext branch, tag or SHA. Empty uses .github/daenext-core-ref.'
+        required: false
+        type: string
+
+concurrency:
+  group: build-daed-openwrt-aarch64
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  APK_TOOLS_URL: 'https://dl-cdn.alpinelinux.org/alpine/v3.23/main/x86_64/apk-tools-static-3.0.9-r0.apk'
+  GEODATA_BASE_URL: 'https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master'
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout DaedNext
+        uses: actions/checkout@v4
+        with:
+          path: DaedNext
+
+      - name: Resolve DaeNext ref
+        id: ref
+        env:
+          DAENEXT_INPUT: ${{ inputs.daenext_ref }}
+        run: |
+          ref="${DAENEXT_INPUT}"
+          if [ -z "$ref" ]; then
+            ref="$(tr -d '[:space:]' < DaedNext/.github/daenext-core-ref)"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout DaeNext
+        uses: actions/checkout@v4
+        with:
+          repository: ksong008/DaeNext
+          ref: ${{ steps.ref.outputs.ref }}
+          path: DaeNext
+
+      - name: Record immutable commits
+        run: |
+          {
+            echo "### Source commits"
+            echo "- DaedNext: $(git -C DaedNext rev-parse HEAD)"
+            echo "- DaeNext: $(git -C DaeNext rev-parse HEAD)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang llvm libelf-dev pkg-config cmake perl xz-utils make file python3 \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
+          clang --version | head -n1
+          aarch64-linux-gnu-gcc --version | head -n1
+
+      - name: Set up Node.js 22.12.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Set up Rust nightly for eBPF
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      - name: Build web assets (make dist)
+        working-directory: DaedNext
+        run: |
+          set -euo pipefail
+          make dist
+          test -d dist
+
+      - name: Fetch geodata
+        working-directory: DaedNext
+        run: |
+          set -euo pipefail
+          mkdir -p build/package-sources/geodata
+          curl --fail --location --retry 3 --show-error \
+            -o build/package-sources/geodata/geoip.dat "$GEODATA_BASE_URL/geoip.dat"
+          curl --fail --location --retry 3 --show-error \
+            -o build/package-sources/geodata/geosite.dat "$GEODATA_BASE_URL/geosite.dat"
+          sha256sum build/package-sources/geodata/*.dat
+
+      - name: Install apk-tools 3
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --show-error -o apk-tools-static.apk "$APK_TOOLS_URL"
+          mkdir -p "$HOME/apk-tool"
+          tar -xzf apk-tools-static.apk -C "$HOME/apk-tool" 2>/dev/null || true
+          test -x "$HOME/apk-tool/sbin/apk.static"
+          echo "APK_TOOL=$HOME/apk-tool/sbin/apk.static" >> "$GITHUB_ENV"
+
+      - name: Set package version
+        env:
+          TAG_INPUT: ${{ inputs.tag_name }}
+        run: |
+          echo "PACKAGE_VERSION=${TAG_INPUT}" >> "$GITHUB_ENV"
+          echo "PACKAGE_RELEASE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Build and package OpenWrt aarch64
+        working-directory: DaedNext
+        env:
+          DAENEXT_ROOT: ${{ github.workspace }}/DaeNext
+          OUT_DIR: ${{ github.workspace }}/out
+          TARGET_DIR: ${{ github.workspace }}/target-openwrt-arm64
+          RUST_TARGET: aarch64-unknown-linux-gnu
+          CPU_TARGET: generic
+          STRIP_TOOL: aarch64-linux-gnu-strip
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu: '--sysroot=/usr/aarch64-linux-gnu'
+        run: |
+          set -euo pipefail
+          bash scripts/package_openwrt_arm64.sh
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: daed-openwrt-aarch64-${{ inputs.tag_name || 'dev' }}-r${{ github.run_number }}
+          path: |
+            out/*.ipk
+            out/*.apk
+            out/SHA256SUMS
+            out/daed-openwrt-arm64.file
+            out/daed-openwrt-arm64-build.log
