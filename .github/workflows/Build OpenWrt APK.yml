@@ -20,13 +20,15 @@ permissions:
   contents: read
 
 env:
-  APK_TOOLS_URL: 'https://dl-cdn.alpinelinux.org/alpine/v3.23/main/x86_64/apk-tools-static-3.0.9-r0.apk'
+  APK_TOOLS_VERSION: '3.0.9-r0'
+  ALPINE_IMAGE: 'alpine:3.23'
   GEODATA_BASE_URL: 'https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master'
+  EXPECTED_APK_COUNT: '4'
 
 jobs:
   package:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: Checkout DaedNext
         uses: actions/checkout@v4
@@ -39,16 +41,17 @@ jobs:
           set -euo pipefail
           bash scripts/check_openwrt_arm64_packaging.sh
 
-
       - name: Resolve DaeNext ref
         id: ref
         env:
           DAENEXT_INPUT: ${{ inputs.daenext_ref }}
         run: |
+          set -euo pipefail
           ref="${DAENEXT_INPUT}"
           if [ -z "$ref" ]; then
             ref="$(tr -d '[:space:]' < DaedNext/.github/daenext-core-ref)"
           fi
+          test -n "$ref"
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Checkout DaeNext
@@ -58,23 +61,43 @@ jobs:
           ref: ${{ steps.ref.outputs.ref }}
           path: DaeNext
 
-      - name: Record immutable commits
+      - name: Resolve package version
+        env:
+          TAG_INPUT: ${{ inputs.tag_name }}
         run: |
+          set -euo pipefail
+          tag="${TAG_INPUT#v}"
+          if [ -z "$tag" ]; then
+            tag="$(sed -n 's/^version = "\([^"]\+\)"/\1/p' DaeNext/Cargo.toml | head -n 1)"
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'; then
+            echo "invalid package version: '$tag'" >&2
+            exit 1
+          fi
+          echo "PACKAGE_VERSION=$tag" >> "$GITHUB_ENV"
+          echo "PACKAGE_RELEASE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Record source commits and package version
+        run: |
+          set -euo pipefail
           {
             echo "### Source commits"
             echo "- DaedNext: $(git -C DaedNext rev-parse HEAD)"
             echo "- DaeNext: $(git -C DaeNext rev-parse HEAD)"
+            echo "### Package"
+            echo "- Version: ${PACKAGE_VERSION}-r${PACKAGE_RELEASE}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install system dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             build-essential clang llvm libelf-dev pkg-config cmake perl xz-utils make file python3 \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             libc6-dev-arm64-cross
-          clang --version | head -n1
-          aarch64-linux-gnu-gcc --version | head -n1
+          clang --version | head -n 1
+          aarch64-linux-gnu-gcc --version | head -n 1
 
       - name: Set up Node.js 22.12.0
         uses: actions/setup-node@v4
@@ -86,30 +109,63 @@ jobs:
         with:
           version: 10
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.98.0
-          targets: aarch64-unknown-linux-gnu
-
+      # nightly must be installed before 1.98.0: dtolnay/rust-toolchain sets the
+      # rustup default to the toolchain it installs, so 1.98.0 goes last to remain default.
       - name: Set up Rust nightly for eBPF
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
           components: rust-src
 
-      - name: Install LLVM development libraries
+      - name: Set up Rust 1.98.0 (default toolchain)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Verify Rust toolchains
         run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustc --version
+          cargo +nightly --version
+          rustup target list --installed | grep -qx 'aarch64-unknown-linux-gnu'
+          rustup component list --toolchain nightly --installed | grep -q '^rust-src'
+
+      - name: Install LLVM 18 development libraries
+        run: |
+          set -euo pipefail
           sudo apt-get install -y llvm-18-dev libclang-18-dev
           test -e /usr/lib/llvm-18/lib/libLLVM.so || test -e /usr/lib/llvm-18/lib/libLLVM-18.so
+          test -x /usr/lib/llvm-18/bin/llvm-config
+          # Export to later steps; a step-level env on the bpf-linker step alone is not visible to the daemon build.
+          echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
 
-      - name: Install bpf-linker
+      - name: Install bpf-linker 0.10.3
         env:
           LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
         run: |
+          set -euo pipefail
           cargo install bpf-linker --version 0.10.3 --locked
           bpf-linker --version
 
+      - name: Cache Cargo registry and OpenWrt target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target-openwrt-arm64
+          key: openwrt-arm64-${{ runner.os }}-${{ hashFiles('DaeNext/Cargo.lock') }}
+          restore-keys: |
+            openwrt-arm64-${{ runner.os }}-
+
+      - name: Install WebUI dependencies
+        working-directory: DaedNext
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
 
       - name: Build web assets (make dist)
         working-directory: DaedNext
@@ -118,32 +174,35 @@ jobs:
           make dist
           test -d dist
 
-      - name: Fetch geodata
+      - name: Fetch and verify geodata
         working-directory: DaedNext
         run: |
           set -euo pipefail
-          mkdir -p build/package-sources/geodata
-          curl --fail --location --retry 3 --show-error \
-            -o build/package-sources/geodata/geoip.dat "$GEODATA_BASE_URL/geoip.dat"
-          curl --fail --location --retry 3 --show-error \
-            -o build/package-sources/geodata/geosite.dat "$GEODATA_BASE_URL/geosite.dat"
-          sha256sum build/package-sources/geodata/*.dat
+          dest=build/package-sources/geodata
+          mkdir -p "$dest"
+          for name in geoip geosite; do
+            curl --fail --location --retry 3 --show-error \
+              -o "$dest/$name.dat" "$GEODATA_BASE_URL/$name.dat"
+            # Guard against an HTML error page being saved as the .dat file.
+            test "$(stat -c%s "$dest/$name.dat")" -gt 1048576
+          done
+          {
+            echo "### Geodata SHA256"
+            echo '```'
+            sha256sum "\$dest"/*.dat
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install apk-tools 3
+      - name: Install apk-tools static ${{ env.APK_TOOLS_VERSION }}
         run: |
           set -euo pipefail
-          curl --fail --location --retry 3 --show-error -o apk-tools-static.apk "$APK_TOOLS_URL"
           mkdir -p "$HOME/apk-tool"
-          tar -xzf apk-tools-static.apk -C "$HOME/apk-tool" 2>/dev/null || true
-          test -x "$HOME/apk-tool/sbin/apk.static"
-          echo "APK_TOOL=$HOME/apk-tool/sbin/apk.static" >> "$GITHUB_ENV"
-
-      - name: Set package version
-        env:
-          TAG_INPUT: ${{ inputs.tag_name }}
-        run: |
-          echo "PACKAGE_VERSION=${TAG_INPUT}" >> "$GITHUB_ENV"
-          echo "PACKAGE_RELEASE=${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+          # Extract apk.static inside the Alpine container so the package format is handled by apk itself.
+          docker run --rm -v "$HOME/apk-tool:/out" "$ALPINE_IMAGE" sh -c \
+            "apk add --no-cache apk-tools-static=${APK_TOOLS_VERSION} && cp /sbin/apk.static /out/apk.static"
+          test -x "$HOME/apk-tool/apk.static"
+          "$HOME/apk-tool/apk.static" --version
+          echo "APK_TOOL=$HOME/apk-tool/apk.static" >> "$GITHUB_ENV"
 
       - name: Build and package OpenWrt aarch64
         working-directory: DaedNext
@@ -159,13 +218,33 @@ jobs:
           set -euo pipefail
           bash scripts/package_openwrt_arm64.sh
 
+      - name: Verify package outputs
+        run: |
+          set -euo pipefail
+          count="$(find out -maxdepth 1 -name '*.apk' | wc -l)"
+          test "$count" -eq "$EXPECTED_APK_COUNT"
+          file_info="$(file out/rootfs/usr/bin/daed)"
+          echo "$file_info"
+          grep -q 'statically linked' <<<"$file_info"
+          find out -maxdepth 1 -name '*.apk' -printf '%f\n' | sort
+
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: daed-openwrt-aarch64-${{ inputs.tag_name || 'dev' }}-r${{ github.run_number }}
+          name: daed-openwrt-aarch64-${{ env.PACKAGE_VERSION }}-r${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 30
           path: |
-            out/*.ipk
             out/*.apk
             out/SHA256SUMS
             out/daed-openwrt-arm64.file
             out/daed-openwrt-arm64-build.log
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daed-openwrt-aarch64-build-log-r${{ github.run_number }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: out/daed-openwrt-arm64-build.log
