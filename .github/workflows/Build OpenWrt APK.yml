@@ -218,6 +218,11 @@ jobs:
           set -euo pipefail
           bash scripts/package_openwrt_arm64.sh
 
+      - name: Show build log on failure
+        if: failure()
+        run: |
+          tail -n 300 "${{ github.workspace }}/out/daed-openwrt-arm64-build.log" || true
+
       - name: Verify package outputs
         run: |
           set -euo pipefail
