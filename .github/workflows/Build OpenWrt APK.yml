@@ -33,6 +33,13 @@ jobs:
         with:
           path: DaedNext
 
+      - name: Check OpenWrt ARM64 packaging contract
+        working-directory: DaedNext
+        run: |
+          set -euo pipefail
+          bash scripts/check_openwrt_arm64_packaging.sh
+
+
       - name: Resolve DaeNext ref
         id: ref
         env:
@@ -91,8 +98,18 @@ jobs:
           toolchain: nightly
           components: rust-src
 
+      - name: Install LLVM development libraries
+        run: |
+          sudo apt-get install -y llvm-18-dev libclang-18-dev
+          test -e /usr/lib/llvm-18/lib/libLLVM.so || test -e /usr/lib/llvm-18/lib/libLLVM-18.so
+
       - name: Install bpf-linker
-        run: cargo install bpf-linker --locked
+        env:
+          LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+        run: |
+          cargo install bpf-linker --version 0.10.3 --locked
+          bpf-linker --version
+
 
       - name: Build web assets (make dist)
         working-directory: DaedNext
