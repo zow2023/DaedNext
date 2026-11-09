@@ -14,6 +14,20 @@ DEFAULT_RELOAD_READY_TIMEOUT=2s
 DEFAULT_RELOAD_RECOVERY_TIMEOUT=30s
 RESOLV_DAE="/tmp/resolv.conf.daed"
 
+get_resolv_target() {
+	local target
+	target="$(readlink -f /tmp/resolv.conf 2>/dev/null)"
+	[ -n "$target" ] || target="/tmp/resolv.conf"
+	echo "$target"
+}
+
+is_daed_resolv_mounted() {
+	local target="$1"
+	awk -v src="$RESOLV_DAE" -v dst="$target" \
+		'$1 == src && $2 == dst { found=1 } END { exit !found }' \
+		/proc/mounts
+}
+
 load_daed_config() {
 	config_load daed
 
@@ -55,13 +69,20 @@ validate_daed_runtime_config() {
 }
 
 hijack_resolv_conf() {
-	grep -q ' /tmp/resolv\.conf ' /proc/mounts && return 0
+	local RESOLV_TARGET
+	RESOLV_TARGET="$(get_resolv_target)"
 
+	# Only regard the Daed bind mount as already mounted.
+	# OpenWrt may have other mounts on the same target.
+	is_daed_resolv_mounted "$RESOLV_TARGET" && return 0
+
+	rm -f "$RESOLV_DAE"
 	grep -E '^(search|domain) ' /tmp/resolv.conf >"$RESOLV_DAE" 2>/dev/null
 
 	local dns_list LOGICAL_WAN
 	. /lib/functions/network.sh
 	network_find_wan LOGICAL_WAN 2>/dev/null
+
 	if [ -n "$LOGICAL_WAN" ]; then
 		dns_list=$(ubus call "network.interface.$LOGICAL_WAN" status 2>/dev/null | \
 			jsonfilter -e '@["dns-server"][*]' 2>/dev/null)
@@ -71,20 +92,40 @@ hijack_resolv_conf() {
 		dns_list=$(awk '/^nameserver/{print $2}' "/tmp/resolv.conf.d/resolv.conf.auto")
 	fi
 
-	[ -z "$dns_list" ] && dns_list="119.29.29.29 223.5.5.5"
+	[ -n "$dns_list" ] || dns_list="119.29.29.29 223.5.5.5"
 
 	for dns in $dns_list; do
 		echo "nameserver $dns" >>"$RESOLV_DAE"
 	done
 
-	mount --bind "$RESOLV_DAE" /tmp/resolv.conf
-	mount -o remount,ro,bind /tmp/resolv.conf
+	# Bind to the resolved real path, not the symlink.
+	if ! mount --bind "$RESOLV_DAE" "$RESOLV_TARGET"; then
+		echo "daed: failed to bind mount $RESOLV_DAE to $RESOLV_TARGET"
+		rm -f "$RESOLV_DAE"
+		return 1
+	fi
+
+	if ! mount -o remount,ro,bind "$RESOLV_TARGET"; then
+		echo "daed: failed to remount $RESOLV_TARGET read-only"
+		umount "$RESOLV_TARGET" 2>/dev/null
+		rm -f "$RESOLV_DAE"
+		return 1
+	fi
+
+	return 0
 }
 
 restore_resolv_conf() {
-	grep -q ' /tmp/resolv\.conf ' /proc/mounts || return 0
-	mount -o remount,rw,bind /tmp/resolv.conf 2>/dev/null
-	umount /tmp/resolv.conf 2>/dev/null
+	local RESOLV_TARGET
+	RESOLV_TARGET="$(get_resolv_target)"
+
+	is_daed_resolv_mounted "$RESOLV_TARGET" || {
+		rm -f "$RESOLV_DAE"
+		return 0
+	}
+
+	mount -o remount,rw,bind "$RESOLV_TARGET" 2>/dev/null
+	umount "$RESOLV_TARGET" 2>/dev/null
 	rm -f "$RESOLV_DAE"
 }
 
