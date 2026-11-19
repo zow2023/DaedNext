@@ -274,7 +274,7 @@ jobs:
           test "$count" -eq "$EXPECTED_APK_COUNT"
           file_info="$(file out/rootfs/usr/bin/daed)"
           echo "$file_info"
-          grep -q 'statically linked' <<<"$file_info"
+          grep -Eq 'statically linked|static-pie linked' <<<"$file_info"
           find out -maxdepth 1 -name '*.apk' -printf '%f\n' | sort
 
       - name: Upload packages
