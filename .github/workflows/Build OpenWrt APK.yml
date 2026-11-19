@@ -132,6 +132,45 @@ jobs:
           rustup target list --installed | grep -qx 'aarch64-unknown-linux-gnu'
           rustup component list --toolchain nightly --installed | grep -q '^rust-src'
 
+      - name: Install DaeNext Rust toolchain and target
+        run: |
+          set -euo pipefail
+
+          # Read the toolchain version pinned by the checked-out DaeNext source.
+          test -f DaeNext/rust-toolchain.toml
+          DAENEXT_TOOLCHAIN="$(sed -nE \
+            's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+            DaeNext/rust-toolchain.toml | head -n 1)"
+
+          test -n "$DAENEXT_TOOLCHAIN"
+          echo "DaeNext Rust toolchain: $DAENEXT_TOOLCHAIN"
+
+          # Install the same components declared by rust-toolchain.toml.
+          rustup toolchain install "$DAENEXT_TOOLCHAIN" \
+            --profile minimal \
+            --component rust-src
+
+          rustup component add --toolchain "$DAENEXT_TOOLCHAIN" clippy rustfmt
+
+          # IMPORTANT: install the cross-compilation target into Rust 1.100.0,
+          # not only into the default Rust 1.98.0 toolchain.
+          rustup target add \
+            --toolchain "$DAENEXT_TOOLCHAIN" \
+            aarch64-unknown-linux-gnu
+
+          rustup target list --toolchain "$DAENEXT_TOOLCHAIN" --installed
+
+      - name: Verify DaeNext Rust target
+        working-directory: DaeNext
+        run: |
+          set -euo pipefail
+
+          rustup show active-toolchain
+          rustc --version
+
+          rustup target list --installed \
+            | grep -qx 'aarch64-unknown-linux-gnu'
+
       - name: Install LLVM 18 development libraries
         run: |
           set -euo pipefail
