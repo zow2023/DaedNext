@@ -42,7 +42,7 @@ export function generateV2rayLink(data: V2rayGeneratorValues): string {
 
   if (protocol === 'vless') {
     const params: Record<string, unknown> = {
-      type: net === 'h2' ? 'http' : net,
+      type: net === 'h2' ? 'http' : net === 'kcp' ? 'mkcp' : net,
       security: tls,
       host,
       headerType: type,
@@ -50,7 +50,7 @@ export function generateV2rayLink(data: V2rayGeneratorValues): string {
       allowInsecure,
     }
 
-    if (net === 'tcp' && flow !== 'none') params.flow = flow
+    if (flow !== 'none') params.flow = flow
     if (net === 'grpc') {
       params.serviceName = path
       if (grpcMode !== 'gun') params.mode = grpcMode
@@ -62,10 +62,18 @@ export function generateV2rayLink(data: V2rayGeneratorValues): string {
       if (extra) params.extra = extra
     } else if (net === 'meek') {
       params.url = path
+    } else if (net === 'hysteria') {
+      params.auth = data.hysteriaAuth
+    } else if (net === 'xdrive') {
+      params.service = 'local'
+      params.remoteFolder = path
     } else {
       params.path = path
     }
     if (mux) params.mux = 1
+    if (data.concurrency !== undefined) params.concurrency = data.concurrency
+    if (data.xudpConcurrency !== undefined) params.xudpConcurrency = data.xudpConcurrency
+    if (data.xudpProxyUDP443 !== undefined) params.xudpProxyUDP443 = data.xudpProxyUDP443
 
     if (alpn !== '') params.alpn = alpn
     if (ech !== '') params.ech = ech

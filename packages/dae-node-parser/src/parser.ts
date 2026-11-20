@@ -17,6 +17,7 @@ import { Base64 } from 'js-base64'
 const TRAILING_SLASH_PATTERN = /\/$/
 const BASE64_CONTENT_PATTERN = /^[-\w+/]+={0,2}$/
 const BASE64_PADDING_PATTERN = /=+$/
+const VLESS_MUX_CONCURRENCY_PATTERN = /^[+-]?\d+$/
 const MASQUE_TARGET_HOST = '{target_host}'
 const MASQUE_TARGET_PORT = '{target_port}'
 const MASQUE_QUERY_KEYS = new Set(['allowInsecure', 'auth', 'sni', 'template', 'transport'])
@@ -807,19 +808,45 @@ function parseVMessStandardUrl(url: string): (Partial<V2rayConfig> & { protocol:
  * Normalize network type to internal representation
  * Handles 'http' -> 'h2' mapping per proposal
  */
-function normalizeNetworkType(type: string): V2rayConfig['net'] {
-  const typeMap: Record<string, V2rayConfig['net']> = {
-    tcp: 'tcp',
-    kcp: 'kcp',
-    ws: 'ws',
-    http: 'h2', // HTTP/2/3 uses 'http' in share link but 'h2' internally
-    h2: 'h2',
-    grpc: 'grpc',
-    httpupgrade: 'httpupgrade',
-    xhttp: 'xhttp',
-    meek: 'meek',
+function knownNetworkType(type: string): V2rayConfig['net'] | undefined {
+  const network = type.toLowerCase()
+  switch (network) {
+    case 'tcp':
+    case 'kcp':
+    case 'ws':
+    case 'h2':
+    case 'grpc':
+    case 'httpupgrade':
+    case 'xhttp':
+    case 'meek':
+      return network
+    case 'http':
+      return 'h2'
   }
-  return typeMap[type.toLowerCase()] || 'tcp'
+}
+
+function normalizeNetworkType(type: string): V2rayConfig['net'] {
+  return knownNetworkType(type) ?? 'tcp'
+}
+
+function normalizeVlessNetworkType(type: string): V2rayConfig['net'] | undefined {
+  switch (type.toLowerCase()) {
+    case '':
+    case 'raw':
+      return 'tcp'
+    case 'websocket':
+      return 'ws'
+    case 'splithttp':
+      return 'xhttp'
+    case 'mkcp':
+      return 'kcp'
+    case 'hysteria':
+      return 'hysteria'
+    case 'xdrive':
+      return 'xdrive'
+    default:
+      return knownNetworkType(type)
+  }
 }
 
 /**
@@ -834,6 +861,8 @@ function getPathValue(params: URLSearchParams, netType: string): string {
       return params.get('seed') || ''
     case 'meek':
       return params.get('url') || ''
+    case 'xdrive':
+      return params.get('remoteFolder') || ''
     default:
       return params.get('path') || ''
   }
@@ -934,7 +963,10 @@ export function parseVLessUrl(url: string): (Partial<V2rayConfig> & { protocol: 
     const params = parsed.searchParams
 
     // Get network type
-    const netType = params.get('type') || 'tcp'
+    const netType = normalizeVlessNetworkType(params.get('type') ?? '')
+    if (!netType) return null
+    if (netType === 'xdrive' && params.get('service') !== 'local') return null
+    if (netType === 'hysteria' && !params.get('auth')) return null
     const grpcMode = netType === 'grpc' ? parseGrpcMode(params.get('mode')) : 'gun'
     if (grpcMode === null) return null
 
@@ -950,7 +982,7 @@ export function parseVLessUrl(url: string): (Partial<V2rayConfig> & { protocol: 
       vlessEncryption: params.get('encryption') || 'none',
       aid: 0,
       // Transport fields (4.3)
-      net: normalizeNetworkType(netType),
+      net: netType,
       type: (params.get('headerType') || 'none') as V2rayConfig['type'],
       host: params.get('host') || '',
       path: getPathValue(params, netType),
@@ -977,12 +1009,31 @@ export function parseVLessUrl(url: string): (Partial<V2rayConfig> & { protocol: 
       pqv: params.get('pqv') || '',
       // Other
       allowInsecure: parseAllowInsecure(params),
-      mux: parseBoolParam(params.get('mux')) || parseBoolParam(params.get('muxEnabled')),
+      mux: parseBoolParam(params.get('mux') ?? params.get('muxEnabled')),
+      concurrency: parseVlessMuxConcurrency(params.get('concurrency')),
+      xudpConcurrency: parseVlessMuxConcurrency(params.get('xudpConcurrency')),
+      xudpProxyUDP443: parseVlessMuxUdp443(params.get('xudpProxyUDP443')),
+      hysteriaAuth: netType === 'hysteria' ? (params.get('auth') ?? '') : undefined,
       v: '',
     }
   } catch {
     return null
   }
+}
+
+function parseVlessMuxConcurrency(value: string | null): number | undefined {
+  if (value === null) return undefined
+  const parsed = Number(value)
+  if (!VLESS_MUX_CONCURRENCY_PATTERN.test(value) || parsed < -32768 || parsed > 32767) {
+    throw new Error('Invalid VLESS mux concurrency')
+  }
+  return parsed
+}
+
+function parseVlessMuxUdp443(value: string | null): V2rayConfig['xudpProxyUDP443'] {
+  if (value === null) return undefined
+  if (value === 'reject' || value === 'allow' || value === 'skip') return value
+  throw new Error('Invalid VLESS mux UDP/443 policy')
 }
 
 /**

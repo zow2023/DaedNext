@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { validateEchConfigListBase64 } from '~/utils/ech'
+import { supportsVlessMux } from '~/utils/vless_encryption'
 import { validateXhttpFormFields } from '~/utils/xhttp'
 
 const UNSIGNED_INTEGER_PATTERN = /^\d+$/
@@ -65,7 +66,7 @@ export const v2raySchema = z
     port: z.number().min(0).max(65535),
     id: z.string().nonempty(),
     aid: z.number().min(0).max(65535),
-    net: z.enum(['tcp', 'kcp', 'ws', 'http', 'h2', 'grpc', 'httpupgrade', 'xhttp', 'meek']),
+    net: z.enum(['tcp', 'kcp', 'ws', 'http', 'h2', 'grpc', 'httpupgrade', 'xhttp', 'meek', 'hysteria', 'xdrive']),
     type: z.enum(['none', 'http', 'srtp', 'utp', 'wechat-video', 'dtls', 'wireguard']),
     host: z.string(),
     path: z.string(),
@@ -106,6 +107,10 @@ export const v2raySchema = z
     v: z.string(),
     allowInsecure: z.boolean().nullable(),
     mux: z.boolean(),
+    concurrency: z.number().int().min(-32768).max(32767).optional(),
+    xudpConcurrency: z.number().int().min(-32768).max(32767).optional(),
+    xudpProxyUDP443: z.enum(['reject', 'allow', 'skip']).optional(),
+    hysteriaAuth: z.string().optional(),
     sni: z.string(),
     // Reality-specific fields
     pbk: z.string(), // public key
@@ -193,14 +198,9 @@ export const v2rayProtocolSchema = v2raySchema
         message: encryptionError,
       })
     }
-    if (data.vlessEncryption.trim() !== '' && data.vlessEncryption.trim() !== 'none') {
-      if (data.mux && data.flow !== 'none') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['mux'],
-          message: 'VLESS Encryption cannot be combined with Vision mux/XUDP',
-        })
-      }
+    const encryption = data.vlessEncryption.trim()
+    const encrypted = encryption !== '' && encryption !== 'none'
+    if (encrypted) {
       if (data.net === 'h2' || data.net === 'meek') {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -210,25 +210,78 @@ export const v2rayProtocolSchema = v2raySchema
       }
     }
 
-    if (!['tcp', 'ws', 'grpc', 'httpupgrade', 'h2', 'xhttp', 'meek'].includes(data.net)) {
+    if (!['tcp', 'ws', 'grpc', 'httpupgrade', 'h2', 'xhttp', 'meek', 'hysteria', 'kcp', 'xdrive'].includes(data.net)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['net'],
-        message: 'Resident VLESS supports tcp, websocket, httpupgrade, grpc, h2, xhttp, and meek only',
+        message: 'Unsupported resident VLESS transport',
       })
     }
-    if (data.tls === 'none' && (data.net !== 'tcp' || data.mux || data.flow !== 'none')) {
+    const encryptedCleartextWrapper = encrypted && ['grpc', 'ws', 'httpupgrade', 'xhttp'].includes(data.net)
+    const encryptedLocalCarrier = encrypted && (data.net === 'kcp' || data.net === 'xdrive')
+    if (
+      data.tls === 'none' &&
+      ((!encryptedCleartextWrapper && !encryptedLocalCarrier && data.net !== 'tcp') ||
+        ((data.mux || data.flow !== 'none') && !encrypted))
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['tls'],
-        message: 'Resident VLESS security=none admits native tcp with empty flow only',
+        message:
+          'Resident VLESS security=none requires TCP or encrypted WS, HTTPUpgrade, gRPC, or XHTTP, and Vision and mux require Encryption',
       })
     }
-    if (data.net !== 'tcp' && data.flow !== 'none') {
+    if (data.net !== 'tcp' && data.flow !== 'none' && !encryptedCleartextWrapper) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['flow'],
-        message: 'Resident VLESS wrapped transports require empty flow',
+        message: 'Resident VLESS Vision over WS, HTTPUpgrade, gRPC, or XHTTP requires Encryption',
+      })
+    }
+    if (
+      data.net === 'hysteria' &&
+      (!encrypted ||
+        data.tls !== 'tls' ||
+        !data.hysteriaAuth ||
+        (data.alpn !== '' && data.alpn !== 'h3') ||
+        data.fp !== '' ||
+        data.ech !== '')
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['hysteriaAuth'],
+        message: 'Hysteria requires auth, H3 TLS and VLESS Encryption',
+      })
+    }
+    if (
+      data.net === 'kcp' &&
+      (!encrypted ||
+        data.tls === 'reality' ||
+        data.type !== 'none' ||
+        data.path !== '' ||
+        data.fp !== '' ||
+        data.ech !== '')
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['net'],
+        message: 'mKCP requires VLESS Encryption, default unmasked settings and optional TLS',
+      })
+    }
+    if (
+      data.net === 'xdrive' &&
+      (!encrypted ||
+        data.tls !== 'none' ||
+        !data.mux ||
+        (data.concurrency ?? 0) < 0 ||
+        (data.xudpConcurrency ?? 0) < 0 ||
+        data.xudpProxyUDP443 === 'skip' ||
+        !data.path.startsWith('/'))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['path'],
+        message: 'XDrive local requires an absolute folder, VLESS Encryption and TCP/XUDP mux',
       })
     }
     if (data.net === 'h2' && data.tls !== 'tls') {
@@ -245,11 +298,11 @@ export const v2rayProtocolSchema = v2raySchema
         message: 'Resident VLESS TCP admits headerType=none only',
       })
     }
-    if (data.mux && (data.net !== 'tcp' || data.tls !== 'tls' || data.flow !== 'none')) {
+    if (data.mux && !supportsVlessMux(data.net, data.tls, data.flow, encrypted)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['mux'],
-        message: 'Resident VLESS mux admits tcp + tls + empty flow only',
+        message: 'VLESS mux requires secured TCP, or Encryption with XHTTP or a Vision transport',
       })
     }
     if (data.tls === 'reality' && data.pbk === '') {

@@ -156,6 +156,15 @@ describe('manual node protocol registry', () => {
 
     expect(new URL(meekLink).searchParams.get('url')).toBe('https://front.example/meek')
     expect(new URL(muxLink).searchParams.get('mux')).toBe('1')
+    const explicit = `${muxLink.split('#')[0]}&concurrency=-1&xudpConcurrency=0&xudpProxyUDP443=skip`
+    const parsed = v2rayProtocol.parseLink(explicit)
+    expect(parsed).toMatchObject({ mux: true, concurrency: -1, xudpConcurrency: 0, xudpProxyUDP443: 'skip' })
+    const values = v2rayProtocol.schema.parse({ ...v2rayProtocol.defaultValues, ...parsed })
+    const reexported = new URL(v2rayProtocol.generateLink(values)).searchParams
+    expect(reexported.get('concurrency')).toBe('-1')
+    expect(reexported.get('xudpConcurrency')).toBe('0')
+    expect(reexported.get('xudpProxyUDP443')).toBe('skip')
+    expect(v2rayProtocol.parseLink(explicit.replace('concurrency=-1', 'concurrency=32768'))).toBeNull()
   })
 
   it('generates and validates a VLESS Encryption account without leaking it to VMess', async () => {
@@ -178,6 +187,52 @@ describe('manual node protocol registry', () => {
       vlessEncryption: encryption,
     })
     expect(new URL(encryptedLink).searchParams.get('encryption')).toBe(encryption)
+
+    const grpcH2c = {
+      ...v2rayProtocol.defaultValues,
+      protocol: 'vless',
+      id: 'uuid',
+      add: 'example.com',
+      port: 8080,
+      net: 'grpc',
+      tls: 'none',
+      path: 'probe',
+      vlessEncryption: encryption,
+    } as const
+    expect(v2rayProtocol.schema.safeParse(grpcH2c).success).toBe(true)
+    expect(v2rayProtocol.schema.safeParse({ ...grpcH2c, vlessEncryption: 'none' }).success).toBe(false)
+    const grpcQuery = new URL(v2rayProtocol.generateLink(grpcH2c)).searchParams
+    expect(grpcQuery.get('encryption')).toBe(encryption)
+    expect(grpcQuery.get('serviceName')).toBe('probe')
+    expect(grpcQuery.get('security') ?? 'none').toBe('none')
+
+    const rawVision = { ...grpcH2c, net: 'tcp', path: '', flow: 'xtls-rprx-vision' } as const
+    expect(v2rayProtocol.schema.safeParse(rawVision).success).toBe(true)
+    for (const net of ['grpc', 'xhttp', 'ws', 'httpupgrade'] as const) {
+      const wrapped = { ...rawVision, net, path: 'probe' }
+      expect(v2rayProtocol.schema.safeParse(wrapped).success).toBe(true)
+      expect(v2rayProtocol.schema.safeParse({ ...wrapped, tls: 'tls', vlessEncryption: 'none' }).success).toBe(false)
+      expect(new URL(v2rayProtocol.generateLink(wrapped)).searchParams.get('flow')).toBe('xtls-rprx-vision')
+    }
+    expect(v2rayProtocol.schema.safeParse({ ...rawVision, vlessEncryption: 'none' }).success).toBe(false)
+    expect(new URL(v2rayProtocol.generateLink(rawVision)).searchParams.get('flow')).toBe('xtls-rprx-vision')
+
+    for (const config of [
+      rawVision,
+      { ...rawVision, net: 'xhttp', path: '/vision' },
+      { ...grpcH2c, net: 'xhttp' },
+    ] as const) {
+      const muxConfig = { ...config, mux: true }
+      expect(v2rayProtocol.schema.safeParse(muxConfig).success).toBe(true)
+      const link = v2rayProtocol.generateLink(muxConfig)
+      expect(new URL(link).searchParams.get('mux')).toBe('1')
+      expect(v2rayProtocol.parseLink(link)).toMatchObject({ net: config.net, flow: config.flow, mux: true })
+    }
+    expect(v2rayProtocol.schema.safeParse({ ...grpcH2c, mux: true }).success).toBe(false)
+    expect(
+      v2rayProtocol.schema.safeParse({ ...grpcH2c, net: 'xhttp', tls: 'tls', mux: true, vlessEncryption: 'none' })
+        .success,
+    ).toBe(false)
 
     const noEncryptionLink = v2rayProtocol.generateLink({
       ...v2rayProtocol.defaultValues,

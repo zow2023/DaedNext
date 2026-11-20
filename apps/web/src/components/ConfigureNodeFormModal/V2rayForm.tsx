@@ -17,6 +17,7 @@ import {
   hasVlessEncryptionAccountPrefix,
   parseVlessEncryptionAccount,
   supportsVlessEncryptionNetwork,
+  supportsVlessMux,
   VLESS_ENCRYPTION_SUITE,
 } from '~/utils/vless_encryption'
 import { generateV2rayLink } from './protocols/generators'
@@ -60,6 +61,9 @@ const VLESS_NETWORK_OPTIONS = [
   { label: 'gRPC', value: 'grpc' },
   { label: 'HTTPUpgrade', value: 'httpupgrade' },
   { label: 'XHTTP', value: 'xhttp' },
+  { label: 'mKCP', value: 'kcp' },
+  { label: 'Xray Hysteria', value: 'hysteria' },
+  { label: 'XDrive local', value: 'xdrive' },
   { label: 'Meek', value: 'meek' },
 ]
 
@@ -101,14 +105,21 @@ export function V2rayForm({ onLinkGeneration, initialValues, actionsPortal }: No
     formValues.protocol === 'vless' &&
     !vlessEncryption.enabled &&
     !supportsVlessEncryptionNetwork(formValues.net || 'tcp')
-  const supportsFlow = formValues.protocol === 'vless' && formValues.net === 'tcp'
+  const supportsFlow =
+    formValues.protocol === 'vless' &&
+    (formValues.net === 'tcp' ||
+      (vlessEncryption.enabled && ['ws', 'httpupgrade', 'grpc', 'xhttp'].includes(formValues.net)))
   const supportsMux =
     formValues.protocol === 'vless' &&
-    formValues.net === 'tcp' &&
-    formValues.tls === 'tls' &&
-    formValues.flow === 'none'
+    supportsVlessMux(formValues.net, formValues.tls, formValues.flow, vlessEncryption.enabled)
   const pathLabel =
-    formValues.net === 'meek' ? 'Meek URL' : formValues.net === 'grpc' ? 'ServiceName' : t('configureNode.path')
+    formValues.net === 'xdrive'
+      ? 'Storage folder'
+      : formValues.net === 'meek'
+        ? 'Meek URL'
+        : formValues.net === 'grpc'
+          ? 'ServiceName'
+          : t('configureNode.path')
 
   const setProtocol = (protocol: V2rayFormValues['protocol']) => {
     setValue('protocol', protocol)
@@ -130,20 +141,45 @@ export function V2rayForm({ onLinkGeneration, initialValues, actionsPortal }: No
   const setNetwork = (net: V2rayFormValues['net']) => {
     setValue('net', net)
     if (net !== 'tcp') {
-      setValue('flow', 'none')
-      setValue('mux', false)
+      if (!vlessEncryption.enabled || !['ws', 'httpupgrade', 'grpc', 'xhttp'].includes(net)) setValue('flow', 'none')
       setValue('type', 'none')
+    }
+    if (!supportsVlessMux(net, formValues.tls, formValues.flow, vlessEncryption.enabled)) setValue('mux', false)
+    if (net === 'hysteria') {
+      setValue('tls', 'tls')
+      setValue('alpn', 'h3')
+      setValue('fp', '')
+      setValue('ech', '')
+    }
+    if (net === 'xdrive') {
+      setValue('tls', 'none')
+      setValue('mux', true)
+      setValue('path', '')
+    }
+    if (net === 'kcp') {
+      setValue('path', '')
+      setValue('fp', '')
+      setValue('ech', '')
     }
     if (formValues.protocol === 'vmess' && (net === 'grpc' || net === 'h2')) {
       setValue('tls', 'tls')
     }
-    if (formValues.protocol === 'vless' && net !== 'tcp' && formValues.tls === 'none') {
+    if (
+      formValues.protocol === 'vless' &&
+      net !== 'tcp' &&
+      !(vlessEncryption.enabled && supportsVlessEncryptionNetwork(net)) &&
+      formValues.tls === 'none'
+    ) {
       setValue('tls', 'tls')
     }
   }
 
   const setVlessEncryption = (changes: Partial<typeof vlessEncryption>) => {
     setValue('vlessEncryption', buildVlessEncryptionAccount({ ...vlessEncryption, ...changes }))
+    if (changes.enabled === false && (formValues.net !== 'tcp' || formValues.tls === 'none')) setValue('flow', 'none')
+    if (changes.enabled === false && !supportsVlessMux(formValues.net, formValues.tls, formValues.flow, false)) {
+      setValue('mux', false)
+    }
   }
 
   return (
@@ -276,8 +312,10 @@ export function V2rayForm({ onLinkGeneration, initialValues, actionsPortal }: No
           onChange={(val) => {
             const tls = (val || 'none') as V2rayFormValues['tls']
             setValue('tls', tls)
-            if (tls !== 'tls') setValue('mux', false)
-            if (tls === 'none') setValue('flow', 'none')
+            if (tls === 'none' && !vlessEncryption.enabled) {
+              setValue('mux', false)
+              setValue('flow', 'none')
+            }
           }}
         />
       )}
@@ -338,13 +376,67 @@ export function V2rayForm({ onLinkGeneration, initialValues, actionsPortal }: No
           onChange={(val) => {
             const flow = (val || 'none') as V2rayFormValues['flow']
             setValue('flow', flow)
-            if (flow !== 'none') setValue('mux', false)
+            if (!supportsVlessMux(formValues.net, formValues.tls, flow, vlessEncryption.enabled)) setValue('mux', false)
           }}
         />
       )}
 
+      {formValues.net === 'hysteria' && (
+        <Input
+          label="Hysteria Auth"
+          type="password"
+          value={formValues.hysteriaAuth ?? ''}
+          onChange={(event) => setValue('hysteriaAuth', event.target.value)}
+        />
+      )}
       {supportsMux && (
-        <Checkbox label="Mux" checked={formValues.mux} onCheckedChange={(checked) => setValue('mux', !!checked)} />
+        <Checkbox
+          label={formValues.net === 'xhttp' || formValues.flow !== 'none' ? 'XUDP' : 'Mux'}
+          checked={formValues.mux}
+          onCheckedChange={(checked) => setValue('mux', !!checked)}
+        />
+      )}
+      {supportsMux && formValues.mux && (
+        <>
+          {formValues.net === 'tcp' && formValues.flow === 'none' && (
+            <Input
+              label="TCP mux concurrency"
+              type="number"
+              min={-32768}
+              max={32767}
+              value={formValues.concurrency ?? ''}
+              onChange={(event) =>
+                setValue('concurrency', event.target.value === '' ? undefined : Number(event.target.value))
+              }
+            />
+          )}
+          <Input
+            label="XUDP concurrency"
+            type="number"
+            min={-32768}
+            max={32767}
+            value={formValues.xudpConcurrency ?? ''}
+            onChange={(event) =>
+              setValue('xudpConcurrency', event.target.value === '' ? undefined : Number(event.target.value))
+            }
+          />
+          <Select
+            label="Mux UDP/443"
+            data={[
+              { label: 'Default', value: 'default' },
+              { label: 'Reject', value: 'reject' },
+              { label: 'Allow', value: 'allow' },
+              { label: 'Skip mux', value: 'skip' },
+            ]}
+            value={formValues.xudpProxyUDP443 ?? 'default'}
+            onChange={(value) =>
+              setValue(
+                'xudpProxyUDP443',
+                value === 'default' ? undefined : (value as V2rayFormValues['xudpProxyUDP443']),
+              )
+            }
+          />
+        </>
       )}
 
       {formValues.tls !== 'none' && (
@@ -445,11 +537,12 @@ export function V2rayForm({ onLinkGeneration, initialValues, actionsPortal }: No
         formValues.net === 'h2' ||
         formValues.net === 'httpupgrade' ||
         formValues.net === 'xhttp' ||
-        formValues.net === 'meek') && (
+        formValues.net === 'meek' ||
+        formValues.net === 'xdrive') && (
         <Input label={pathLabel} value={formValues.path} onChange={(e) => setValue('path', e.target.value)} />
       )}
 
-      {formValues.net === 'kcp' && (
+      {formValues.net === 'kcp' && formValues.protocol === 'vmess' && (
         <Input label="Seed" value={formValues.path} onChange={(e) => setValue('path', e.target.value)} />
       )}
 
