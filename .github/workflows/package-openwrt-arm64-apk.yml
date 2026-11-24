@@ -8,9 +8,10 @@ on:
         required: false
         type: string
       package_arches:
-        description: Optional OpenWrt package arch list (space separated). Empty uses the script default.
+        description: OpenWrt APK architectures (space separated). Defaults to aarch64_cortex-a53.
         required: false
         type: string
+        default: 'aarch64_cortex-a53'
       package_version:
         description: Optional package version. Empty reads it from the DaeNext workspace Cargo.toml.
         required: false
@@ -200,7 +201,7 @@ jobs:
           CC_aarch64_unknown_linux_gnu="${CC_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-gcc}" \
           CXX_aarch64_unknown_linux_gnu="${CXX_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-g++}" \
           AR_aarch64_unknown_linux_gnu="${AR_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-ar}" \
-          RUSTFLAGS="${RUSTFLAGS:--C target-feature=+crt-static -C target-cpu=generic}" \
+          RUSTFLAGS="${RUSTFLAGS:--C target-feature=+crt-static -C target-cpu=cortex-a53}" \
             make daed-rust-native DAED_SKIP_WEB_BUILD=1 \
               RUST_WORKSPACE="$GITHUB_WORKSPACE/DaeNext" RUST_TARGET_DIR="$TARGET_DIR" RUST_TARGET="$RUST_TARGET" \
               OUTPUT="$OUT_DIR/daed" VERSION="${DAED_VERSION:-$PACKAGE_VERSION-rb${{ inputs.package_release || '1' }}}" \
@@ -209,7 +210,7 @@ jobs:
 
       - name: Package OpenWrt arm64 apk
         env:
-          OPENWRT_ARM64_PACKAGE_ARCHES: ${{ inputs.package_arches }}
+          OPENWRT_ARM64_PACKAGE_ARCHES: ${{ inputs.package_arches || 'aarch64_cortex-a53' }}
           PACKAGE_RELEASE: ${{ inputs.package_release || '1' }}
         run: |
           set -euo pipefail
