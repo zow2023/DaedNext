@@ -1,0 +1,199 @@
+name: Package OpenWrt arm64 APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      daenext_ref:
+        description: Optional DaeNext core branch, tag or SHA. Empty follows .github/daenext-core-ref.
+        required: false
+        type: string
+      package_arches:
+        description: Optional OpenWrt package arch list (space separated). Empty uses the script default.
+        required: false
+        type: string
+      package_version:
+        description: Optional package version. Empty reads it from the DaeNext workspace Cargo.toml.
+        required: false
+        type: string
+      package_release:
+        description: Package release iteration.
+        required: false
+        type: string
+        default: '1'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_RELEASE_LTO: 'fat'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+concurrency:
+  group: package-openwrt-arm64-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-daenext-ref:
+    timeout-minutes: 5
+    runs-on: ubuntu-22.04
+    outputs:
+      daenext_ref: ${{ steps.core.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Resolve DaeNext core ref
+        id: resolve
+        env:
+          INPUT_REF: ${{ inputs.daenext_ref }}
+        run: |
+          set -euo pipefail
+          ref="$INPUT_REF"
+          if [ -z "$ref" ]; then
+            ref="$(tr -d '[:space:]' < .github/daenext-core-ref)"
+          fi
+          test -n "$ref"
+          echo "daenext_ref=$ref" >>"$GITHUB_OUTPUT"
+      - name: Resolve core checkout to an immutable commit
+        id: core
+        uses: actions/checkout@v6
+        with:
+          repository: ksong008/DaeNext
+          ref: ${{ steps.resolve.outputs.daenext_ref }}
+          path: DaeNext
+          persist-credentials: false
+      - name: Record core commit
+        env:
+          CORE_SHA: ${{ steps.core.outputs.commit }}
+        run: printf "DaeNext core commit - \`%s\`\n" "$CORE_SHA" >>"$GITHUB_STEP_SUMMARY"
+
+  package-openwrt-arm64-apk:
+    needs: [resolve-daenext-ref]
+    name: Build daed and package OpenWrt arm64 apk
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      APK_TOOL: ${{ github.workspace }}/build/apk-tools/sbin/apk.static
+      OUT_DIR: ${{ github.workspace }}/build/openwrt-arm64-apk
+      TARGET_DIR: ${{ github.workspace }}/build/target-openwrt-arm64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v6
+        with:
+          repository: ksong008/DaeNext
+          ref: ${{ needs.resolve-daenext-ref.outputs.daenext_ref }}
+          path: DaeNext
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v5.0.0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.12.0'
+          cache: pnpm
+
+      - name: Setup Rust from the checked-out core
+        working-directory: DaeNext
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain
+          rustup component add rust-src
+          rustup target add aarch64-unknown-linux-gnu
+          cargo install bpf-linker --version 0.10.3 --locked
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            DaeNext -> target
+
+      - name: Install native build dependencies
+        run: |
+          set -euo pipefail
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          for attempt in 1 2 3; do
+            if sudo apt-get update \
+              -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            gcc-aarch64-linux-gnu \
+            libelf-dev \
+            llvm \
+            perl \
+            pkg-config
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build web
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          pnpm build --filter daed
+          mv -T apps/web/dist dist
+
+      - name: Download geodata
+        run: |
+          set -euo pipefail
+          mkdir -p build/package-sources/geodata
+          curl --fail --location --retry 3 --retry-delay 2 --connect-timeout 20 --show-error \
+            -o build/package-sources/geodata/geoip.dat \
+            https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat
+          curl --fail --location --retry 3 --retry-delay 2 --connect-timeout 20 --show-error \
+            -o build/package-sources/geodata/geosite.dat \
+            https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat
+
+      - name: Install apk-tools v3 (static)
+        run: |
+          set -euo pipefail
+          mkdir -p build/apk-tools
+          curl --fail --location --retry 3 --retry-delay 2 --connect-timeout 20 --show-error \
+            -o build/apk-tools/apk-tools-static.apk \
+            https://dl-cdn.alpinelinux.org/alpine/edge/main/x86_64/apk-tools-static-3.0.11-r0.apk
+          tar -xzf build/apk-tools/apk-tools-static.apk -C build/apk-tools
+          "$APK_TOOL" --version
+
+      - name: Build and package OpenWrt arm64 apk
+        env:
+          OPENWRT_ARM64_PACKAGE_ARCHES: ${{ inputs.package_arches }}
+          PACKAGE_VERSION: ${{ inputs.package_version }}
+          PACKAGE_RELEASE: ${{ inputs.package_release || '1' }}
+        run: |
+          set -euo pipefail
+          bash scripts/package_openwrt_arm64.sh
+
+      - name: Inspect produced apk packages
+        run: |
+          set -euo pipefail
+          for package in "$OUT_DIR"/*.apk; do
+            echo "== $package"
+            "$APK_TOOL" adbdump "$package" | head -n 40 || echo "adbdump unavailable for $package"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: daed-openwrt-arm64-apk-${{ github.sha }}
+          retention-days: 14
+          path: |
+            ${{ env.OUT_DIR }}/*.apk
+            ${{ env.OUT_DIR }}/SHA256SUMS
+            ${{ env.OUT_DIR }}/daed-openwrt-arm64.file
+            ${{ env.OUT_DIR }}/daed-openwrt-arm64-build.log
