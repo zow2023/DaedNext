@@ -39,7 +39,7 @@ concurrency:
 jobs:
   resolve-daenext-ref:
     timeout-minutes: 5
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       daenext_ref: ${{ steps.core.outputs.commit }}
     steps:
@@ -74,8 +74,8 @@ jobs:
   package-openwrt-arm64-apk:
     needs: [resolve-daenext-ref]
     name: Build daed and package OpenWrt arm64 apk
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     env:
       APK_TOOL: ${{ github.workspace }}/build/apk-tools/sbin/apk.static
       OUT_DIR: ${{ github.workspace }}/build/openwrt-arm64-apk
@@ -141,6 +141,13 @@ jobs:
             perl \
             pkg-config
 
+      - name: Verify cross toolchain
+        run: |
+          set -euo pipefail
+          aarch64-linux-gnu-gcc --version | head -n 1
+          aarch64-linux-gnu-g++ --version | head -n 1
+          aarch64-linux-gnu-ar --version | head -n 1
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -189,8 +196,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$OUT_DIR"
-          aarch64-linux-gnu-gcc --version | head -n 1
-          aarch64-linux-gnu-g++ --version | head -n 1
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-aarch64-linux-gnu-gcc}" \
           CC_aarch64_unknown_linux_gnu="${CC_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-gcc}" \
           CXX_aarch64_unknown_linux_gnu="${CXX_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-g++}" \
