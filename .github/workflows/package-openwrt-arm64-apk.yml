@@ -1,4 +1,4 @@
-name: Package OpenWrt arm64 APK
+name: Package OpenWrt arm64 APK (25.12)
 
 on:
   workflow_dispatch:
@@ -80,6 +80,7 @@ jobs:
       APK_TOOL: ${{ github.workspace }}/build/apk-tools/sbin/apk.static
       OUT_DIR: ${{ github.workspace }}/build/openwrt-arm64-apk
       TARGET_DIR: ${{ github.workspace }}/build/target-openwrt-arm64
+      RUST_TARGET: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v6
         with:
@@ -134,7 +135,7 @@ jobs:
             build-essential \
             clang \
             cmake \
-            gcc-aarch64-linux-gnu \
+            crossbuild-essential-arm64 \
             libelf-dev \
             llvm \
             perl \
@@ -171,24 +172,63 @@ jobs:
           tar -xzf build/apk-tools/apk-tools-static.apk -C build/apk-tools
           "$APK_TOOL" --version
 
-      - name: Build and package OpenWrt arm64 apk
+      - name: Resolve package version
+        env:
+          INPUT_VERSION: ${{ inputs.package_version }}
+        run: |
+          set -euo pipefail
+          version="$INPUT_VERSION"
+          if [ -z "$version" ]; then
+            version="$(sed -n 's/^version = "\([^"]\+\)"/\1/p' DaeNext/Cargo.toml | head -n 1)"
+          fi
+          test -n "$version"
+          echo "PACKAGE_VERSION=$version" >>"$GITHUB_ENV"
+          echo "Resolved package version: $version"
+
+      - name: Cross-build daed (aarch64, visible output)
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          aarch64-linux-gnu-gcc --version | head -n 1
+          aarch64-linux-gnu-g++ --version | head -n 1
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-aarch64-linux-gnu-gcc}" \
+          CC_aarch64_unknown_linux_gnu="${CC_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-gcc}" \
+          CXX_aarch64_unknown_linux_gnu="${CXX_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-g++}" \
+          AR_aarch64_unknown_linux_gnu="${AR_aarch64_unknown_linux_gnu:-aarch64-linux-gnu-ar}" \
+          RUSTFLAGS="${RUSTFLAGS:--C target-feature=+crt-static -C target-cpu=generic}" \
+            make daed-rust-native DAED_SKIP_WEB_BUILD=1 \
+              RUST_WORKSPACE="$GITHUB_WORKSPACE/DaeNext" RUST_TARGET_DIR="$TARGET_DIR" RUST_TARGET="$RUST_TARGET" \
+              OUTPUT="$OUT_DIR/daed" VERSION="${DAED_VERSION:-$PACKAGE_VERSION-rb${{ inputs.package_release || '1' }}}" \
+              DAED_PRODUCT_TARGET=linux-arm64 2>&1 | tee "$OUT_DIR/daed-cross-build.log"
+          file "$OUT_DIR/daed"
+
+      - name: Package OpenWrt arm64 apk
         env:
           OPENWRT_ARM64_PACKAGE_ARCHES: ${{ inputs.package_arches }}
-          PACKAGE_VERSION: ${{ inputs.package_version }}
           PACKAGE_RELEASE: ${{ inputs.package_release || '1' }}
         run: |
           set -euo pipefail
-          bash scripts/package_openwrt_arm64.sh
+          source scripts/package_openwrt_arm64.sh
+          build_rootfs "$OUT_DIR/daed" "$OUT_DIR/rootfs"
+          for package_arch in $OPENWRT_ARM64_PACKAGE_ARCHES; do
+            build_ipk "$OUT_DIR/rootfs" "$OUT_DIR/ipk-control-$package_arch" \
+              "$OUT_DIR/daed_${PACKAGE_VERSION}-r${PACKAGE_RELEASE}_openwrt_${package_arch}_jemalloc.ipk" "$package_arch"
+            build_apk "$OUT_DIR/rootfs" "$OUT_DIR/apk-scripts-$package_arch" \
+              "$OUT_DIR/daed-${PACKAGE_VERSION}-r${PACKAGE_RELEASE}.openwrt-${package_arch}-jemalloc.apk" "$package_arch"
+          done
+          sha256sum "$OUT_DIR"/*.ipk "$OUT_DIR"/*.apk >"$OUT_DIR/SHA256SUMS"
+          file "$OUT_DIR/rootfs/usr/bin/daed" >"$OUT_DIR/daed-openwrt-arm64.file"
 
       - name: Inspect produced apk packages
         run: |
           set -euo pipefail
           for package in "$OUT_DIR"/*.apk; do
             echo "== $package"
-            "$APK_TOOL" adbdump "$package" | head -n 40 || echo "adbdump unavailable for $package"
+            "$APK_TOOL" adbdump "$package" | head -n 30
           done
 
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: daed-openwrt-arm64-apk-${{ github.sha }}
           retention-days: 14
@@ -196,4 +236,4 @@ jobs:
             ${{ env.OUT_DIR }}/*.apk
             ${{ env.OUT_DIR }}/SHA256SUMS
             ${{ env.OUT_DIR }}/daed-openwrt-arm64.file
-            ${{ env.OUT_DIR }}/daed-openwrt-arm64-build.log
+            ${{ env.OUT_DIR }}/daed-cross-build.log
